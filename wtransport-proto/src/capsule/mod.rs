@@ -65,6 +65,7 @@ mod capsule_types {
 /// Capsules types implementations.
 pub mod capsules {
     pub use super::close_wt_session::CloseWebTransportSession;
+    pub use super::close_wt_session::MAX_REASON_LEN;
 }
 
 mod close_wt_session;
@@ -81,5 +82,40 @@ mod tests {
             capsules::CloseWebTransportSession::with_capsule(&capsule).expect("Should parse");
         assert_eq!(close.error_code(), VarInt::from_u32(0));
         assert_eq!(close.reason(), "");
+    }
+
+    #[test]
+    fn capsule_close_wt_session_roundtrip() {
+        let frame =
+            capsules::CloseWebTransportSession::new(4001, "access revoked").generate_frame();
+        assert!(matches!(frame.kind(), FrameKind::Data));
+
+        let capsule = Capsule::with_frame(&frame).unwrap();
+        let close =
+            capsules::CloseWebTransportSession::with_capsule(&capsule).expect("Should parse");
+        assert_eq!(close.error_code(), VarInt::from_u32(4001));
+        assert_eq!(close.reason(), "access revoked");
+    }
+
+    #[test]
+    fn capsule_close_wt_session_wire() {
+        let frame = capsules::CloseWebTransportSession::new(0, "").generate_frame();
+        assert_eq!(frame.payload(), [104, 67, 4, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn capsule_close_wt_session_max_reason() {
+        let reason = "a".repeat(1024);
+        let frame = capsules::CloseWebTransportSession::new(1, &reason).generate_frame();
+        let capsule = Capsule::with_frame(&frame).unwrap();
+        let close =
+            capsules::CloseWebTransportSession::with_capsule(&capsule).expect("Should parse");
+        assert_eq!(close.reason(), reason);
+    }
+
+    #[test]
+    #[should_panic]
+    fn capsule_close_wt_session_reason_too_long() {
+        capsules::CloseWebTransportSession::new(1, "a".repeat(1025));
     }
 }

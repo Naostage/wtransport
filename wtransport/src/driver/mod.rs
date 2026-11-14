@@ -14,6 +14,7 @@ use crate::error::SendDatagramError;
 use crate::stream::OpeningBiStream;
 use crate::stream::OpeningUniStream;
 use crate::SessionId;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -22,6 +23,7 @@ use tracing::instrument;
 use tracing::trace;
 use tracing::Instrument;
 use utils::BiChannelEndpoint;
+use wtransport_proto::capsule::capsules::CloseWebTransportSession;
 use wtransport_proto::error::ErrorCode;
 use wtransport_proto::frame::Frame;
 use wtransport_proto::session::SessionRequest;
@@ -31,8 +33,13 @@ use wtransport_proto::settings::Settings;
 pub enum DriverError {
     Proto(ErrorCode),
     ApplicationClosed(ApplicationClose),
+    LocallyClosed,
     NotConnected,
 }
+
+/// How long closing a session waits for the peer to acknowledge the capsule
+/// and close the QUIC connection, before closing it locally.
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub struct Driver {
@@ -42,6 +49,7 @@ pub struct Driver {
     ready_uni_wt_streams: Mutex<mpsc::Receiver<StreamUniRemoteWT>>,
     ready_bi_wt_streams: Mutex<mpsc::Receiver<StreamBiRemoteWT>>,
     ready_datagrams: Mutex<mpsc::Receiver<Datagram>>,
+    close_session: mpsc::Sender<CloseWebTransportSession>,
     driver_result: SharedResultGet<DriverError>,
 }
 
@@ -52,6 +60,7 @@ impl Driver {
         let ready_uni_wt_streams = mpsc::channel(4);
         let ready_bi_wt_streams = mpsc::channel(1);
         let ready_datagrams = mpsc::channel(1);
+        let close_session = mpsc::channel(1);
         let driver_result = shared_result();
 
         tokio::spawn(
@@ -62,6 +71,7 @@ impl Driver {
                 ready_uni_wt_streams.0,
                 ready_bi_wt_streams.0,
                 ready_datagrams.0,
+                close_session.1,
                 driver_result.0,
             )
             .run()
@@ -75,8 +85,21 @@ impl Driver {
             ready_uni_wt_streams: Mutex::new(ready_uni_wt_streams.1),
             ready_bi_wt_streams: Mutex::new(ready_bi_wt_streams.1),
             ready_datagrams: Mutex::new(ready_datagrams.1),
+            close_session: close_session.0,
             driver_result: driver_result.1,
         }
+    }
+
+    /// Closes the session with `close_session` and waits for the driver to terminate.
+    pub async fn close_session(&self, close_session: CloseWebTransportSession) {
+        // An error means the driver has already terminated.
+        let _ = self.close_session.send(close_session).await;
+        let _ = self.terminated().await;
+    }
+
+    /// Waits for the driver to terminate and returns its error (`None` if it panicked).
+    pub async fn terminated(&self) -> Option<DriverError> {
+        self.driver_result.result().await
     }
 
     pub async fn accept_settings(&self) -> Result<Settings, DriverError> {
@@ -260,6 +283,7 @@ mod worker {
         ready_uni_wt_streams: mpsc::Sender<StreamUniRemoteWT>,
         ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
         ready_datagrams: mpsc::Sender<Datagram>,
+        close_session: mpsc::Receiver<CloseWebTransportSession>,
         driver_result: SharedResultSet<DriverError>,
         local_settings_stream: LocalSettingsStream,
         remote_settings_stream: RemoteSettingsStream,
@@ -269,6 +293,7 @@ mod worker {
     }
 
     impl Worker {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             quic_connection: quinn::Connection,
             ready_settings: mpsc::Sender<Settings>,
@@ -276,6 +301,7 @@ mod worker {
             ready_uni_wt_streams: mpsc::Sender<StreamUniRemoteWT>,
             ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
             ready_datagrams: mpsc::Sender<Datagram>,
+            close_session: mpsc::Receiver<CloseWebTransportSession>,
             driver_result: SharedResultSet<DriverError>,
         ) -> Self {
             Self {
@@ -285,6 +311,7 @@ mod worker {
                 ready_uni_wt_streams,
                 ready_bi_wt_streams,
                 ready_datagrams,
+                close_session,
                 driver_result,
                 local_settings_stream: LocalSettingsStream::empty(),
                 remote_settings_stream: RemoteSettingsStream::empty(),
@@ -305,7 +332,7 @@ mod worker {
             debug!("Ended with error: {:?}", error);
 
             match &error {
-                DriverError::ApplicationClosed(_) => {
+                DriverError::ApplicationClosed(_) | DriverError::LocallyClosed => {
                     // Termination procedure
                     // TODO Reset send sides of all streams with SessionGone error
                     self.quic_connection
@@ -382,11 +409,32 @@ mod worker {
                         return Err(error);
                     }
 
+                    // The session stream is registered before the `Connection` exists,
+                    // so this waits for it rather than dropping the request.
+                    close_session = self.close_session.recv(), if !self.connect_stream.is_empty() => {
+                        let Some(close_session) = close_session else {
+                            return Err(DriverError::NotConnected);
+                        };
+
+                        return Err(self.close_session(close_session).await);
+                    }
+
                     () = self.driver_result.closed() => {
                         return Err(DriverError::NotConnected);
                     }
                 }
             }
+        }
+
+        async fn close_session(&mut self, close_session: CloseWebTransportSession) -> DriverError {
+            let _ = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, async {
+                self.connect_stream.close(close_session).await;
+                // The peer closes the QUIC connection once it reads the capsule.
+                let _ = self.quic_connection.closed().await;
+            })
+            .await;
+
+            DriverError::LocallyClosed
         }
 
         async fn open_and_send_settings(&mut self) -> Result<(), DriverError> {

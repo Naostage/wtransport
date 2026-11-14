@@ -95,6 +95,7 @@
 use crate::datagram::Datagram;
 use crate::driver::utils::varint_w2q;
 use crate::driver::Driver;
+use crate::driver::DriverError;
 use crate::error::ConnectionError;
 use crate::error::ExportKeyingMaterialError;
 use crate::error::SendDatagramError;
@@ -110,6 +111,7 @@ use crate::VarInt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use wtransport_proto::capsule::capsules::CloseWebTransportSession;
 
 /// A WebTransport session connection.
 ///
@@ -306,9 +308,40 @@ impl Connection {
         self.quic_connection.close(varint_w2q(error_code), reason);
     }
 
+    /// Closes the WebTransport session with an application `error_code` and `reason`.
+    ///
+    /// Unlike [`close`](Self::close), the peer receives `error_code` and `reason`
+    /// as a WebTransport session close (a `CLOSE_WEBTRANSPORT_SESSION` capsule), which
+    /// is what browsers expose as `WebTransportCloseInfo`.
+    ///
+    /// This sends the capsule and finishes the session's CONNECT stream, then waits for the peer
+    /// to close the connection. The connection is closed locally if the peer does not within a
+    /// few seconds. This method returns once the connection is closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reason` is longer than
+    /// [`MAX_REASON_LEN`](wtransport_proto::capsule::capsules::MAX_REASON_LEN) bytes.
+    pub async fn close_session(&self, error_code: u32, reason: &str) {
+        let close_session = CloseWebTransportSession::new(error_code, reason);
+        self.driver.close_session(close_session).await;
+        self.quic_connection.closed().await;
+    }
+
     /// Waits for the connection to be closed for any reason.
+    ///
+    /// If the session was closed (see [`close_session`](Self::close_session)), this returns
+    /// the code and reason of the session close rather than of the QUIC connection close.
     pub async fn closed(&self) -> ConnectionError {
-        self.quic_connection.closed().await.into()
+        let quic_error = self.quic_connection.closed().await;
+
+        match self.driver.terminated().await {
+            Some(DriverError::ApplicationClosed(close)) => {
+                ConnectionError::ApplicationClosed(close)
+            }
+            Some(DriverError::LocallyClosed) => ConnectionError::LocallyClosed,
+            Some(DriverError::Proto(_) | DriverError::NotConnected) | None => quic_error.into(),
+        }
     }
 
     /// Returns the WebTransport session identifier.
@@ -422,5 +455,109 @@ impl Connection {
     #[inline(always)]
     pub fn quic_connection_mut(&mut self) -> &mut quinn::Connection {
         &mut self.quic_connection
+    }
+}
+
+#[cfg(all(test, feature = "self-signed"))]
+mod tests {
+    use super::*;
+    use crate::error::ApplicationClose;
+    use crate::ClientConfig;
+    use crate::Endpoint;
+    use crate::Identity;
+    use crate::ServerConfig;
+
+    async fn session_pair() -> (Connection, Connection) {
+        let identity = Identity::self_signed(["localhost"]).unwrap();
+        let hash = identity.certificate_chain().as_slice()[0].hash();
+
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{}", server.local_addr().unwrap().port());
+
+        let client = Endpoint::client(
+            ClientConfig::builder()
+                .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .with_server_certificate_hashes([hash])
+                .build(),
+        )
+        .unwrap();
+
+        let accepting = async { server.accept().await.await.unwrap().accept().await.unwrap() };
+
+        let (server_connection, client_connection) =
+            tokio::join!(accepting, async { client.connect(url).await.unwrap() });
+
+        (server_connection, client_connection)
+    }
+
+    /// Asserts `error_code` reached `connection` through the capsule, not the QUIC close.
+    fn assert_not_in_quic_close(connection: &Connection, error_code: u32) {
+        assert!(!matches!(
+            connection.quic_connection.close_reason(),
+            Some(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code == quinn::VarInt::from_u32(error_code)
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_session_sends_code_and_reason_in_capsule() {
+        let (server, client) = session_pair().await;
+
+        tokio::spawn(async move { server.close_session(4001, "access revoked").await });
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .unwrap();
+        assert_eq!(
+            closed,
+            ConnectionError::ApplicationClosed(ApplicationClose::new(
+                VarInt::from_u32(4001),
+                b"access revoked".to_vec().into_boxed_slice()
+            ))
+        );
+
+        assert_not_in_quic_close(&client, 4001);
+    }
+
+    #[tokio::test]
+    async fn close_session_closes_connection() {
+        let (server, _client) = session_pair().await;
+
+        tokio::time::timeout(Duration::from_secs(5), server.close_session(0, ""))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), server.closed())
+                .await
+                .unwrap(),
+            ConnectionError::LocallyClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_from_client_reaches_server() {
+        let (server, client) = session_pair().await;
+
+        tokio::spawn(async move { client.close_session(7, "bye").await });
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), server.closed())
+            .await
+            .unwrap();
+        assert_eq!(
+            closed,
+            ConnectionError::ApplicationClosed(ApplicationClose::new(
+                VarInt::from_u32(7),
+                b"bye".to_vec().into_boxed_slice()
+            ))
+        );
+
+        assert_not_in_quic_close(&server, 7);
     }
 }
