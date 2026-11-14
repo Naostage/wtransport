@@ -30,6 +30,24 @@ impl ConnectStream {
         self.stream = Some(stream);
     }
 
+    /// Sends `close_session` on the CONNECT stream and finishes it.
+    ///
+    /// Waits until the peer acknowledges or stops the stream, and ends its own side with a FIN
+    /// or a reset. A peer that sends its own capsule finishes the stream right after it.
+    pub async fn close(&mut self, close_session: capsules::CloseWebTransportSession) {
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+
+        if stream
+            .write_frame(close_session.generate_frame())
+            .await
+            .is_ok()
+        {
+            stream.finish_and_drain().await;
+        }
+    }
+
     pub async fn run(&mut self) -> DriverError {
         let stream = match self.stream.as_mut() {
             Some(stream) => stream,
