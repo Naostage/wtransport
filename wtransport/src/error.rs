@@ -48,6 +48,7 @@ impl ConnectionError {
         match driver_error {
             DriverError::Proto(error_code) => Self::local_h3_error(error_code),
             DriverError::ApplicationClosed(close) => Self::ApplicationClosed(close),
+            DriverError::LocallyClosed => Self::LocallyClosed,
             DriverError::NotConnected => Self::no_connect(quic_connection),
         }
     }

@@ -1,7 +1,11 @@
+use crate::bytes::BytesWriter;
+use crate::capsule::capsule_types;
 use crate::capsule::Capsule;
 use crate::capsule::CapsuleKind;
 use crate::error::ErrorCode;
+use crate::frame::Frame;
 use crate::varint::VarInt;
+use std::borrow::Cow;
 
 /// Capsules for WebTransport session termination.
 #[derive(Debug)]
@@ -11,6 +15,28 @@ pub struct CloseWebTransportSession {
 }
 
 impl CloseWebTransportSession {
+    /// Maximum length of the reason, in bytes.
+    pub const MAX_REASON_LEN: usize = 1024;
+
+    /// Creates a new capsule closing the session with `error_code` and `reason`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reason` is longer than [`MAX_REASON_LEN`](Self::MAX_REASON_LEN) bytes.
+    pub fn new<R>(error_code: u32, reason: R) -> Self
+    where
+        R: Into<String>,
+    {
+        let reason = reason.into();
+        assert!(
+            reason.len() <= Self::MAX_REASON_LEN,
+            "reason is longer than {} bytes",
+            Self::MAX_REASON_LEN
+        );
+
+        Self { error_code, reason }
+    }
+
     /// Parses from [`Capsule`].
     ///
     /// # Panics
@@ -18,8 +44,6 @@ impl CloseWebTransportSession {
     /// Panics if `capsule` is not
     /// [`CloseWebTransportSession`](CapsuleKind::CloseWebtransportsession) type.
     pub fn with_capsule(capsule: &Capsule) -> Result<Self, ErrorCode> {
-        const MAX_REASON_LEN: usize = 1024;
-
         assert!(matches!(
             capsule.kind(),
             CapsuleKind::CloseWebTransportSession
@@ -27,7 +51,7 @@ impl CloseWebTransportSession {
 
         let payload = capsule.payload();
 
-        if payload.len() < 4 || payload.len() > 4 + MAX_REASON_LEN {
+        if payload.len() < 4 || payload.len() > 4 + Self::MAX_REASON_LEN {
             return Err(ErrorCode::Datagram);
         }
 
@@ -48,5 +72,28 @@ impl CloseWebTransportSession {
     /// Returns the reason sent over this capsule.
     pub fn reason(&self) -> &str {
         &self.reason
+    }
+
+    /// Generates a [`Data`](crate::frame::FrameKind::Data) [`Frame`] carrying this capsule.
+    pub fn generate_frame(&self) -> Frame<'static> {
+        let mut payload = Vec::new();
+
+        payload
+            .put_varint(capsule_types::CAPSULE_TYPE_CLOSE_WEBTRANSPORT_SESSION)
+            .expect("Vec does not have EOF");
+
+        payload
+            .put_varint(VarInt::from_u32(4 + self.reason.len() as u32))
+            .expect("Vec does not have EOF");
+
+        payload
+            .put_bytes(&self.error_code.to_be_bytes())
+            .expect("Vec does not have EOF");
+
+        payload
+            .put_bytes(self.reason.as_bytes())
+            .expect("Vec does not have EOF");
+
+        Frame::new_data(Cow::Owned(payload))
     }
 }

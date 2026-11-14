@@ -14,6 +14,7 @@ use crate::error::SendDatagramError;
 use crate::stream::OpeningBiStream;
 use crate::stream::OpeningUniStream;
 use crate::SessionId;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -22,6 +23,7 @@ use tracing::instrument;
 use tracing::trace;
 use tracing::Instrument;
 use utils::BiChannelEndpoint;
+use wtransport_proto::capsule::capsules::CloseWebTransportSession;
 use wtransport_proto::error::ErrorCode;
 use wtransport_proto::frame::Frame;
 use wtransport_proto::session::SessionRequest;
@@ -31,8 +33,12 @@ use wtransport_proto::settings::Settings;
 pub enum DriverError {
     Proto(ErrorCode),
     ApplicationClosed(ApplicationClose),
+    LocallyClosed,
     NotConnected,
 }
+
+/// The bound on the wait in [`Connection::close_session`](crate::Connection::close_session).
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub struct Driver {
@@ -42,6 +48,7 @@ pub struct Driver {
     ready_uni_wt_streams: Mutex<mpsc::Receiver<StreamUniRemoteWT>>,
     ready_bi_wt_streams: Mutex<mpsc::Receiver<StreamBiRemoteWT>>,
     ready_datagrams: Mutex<mpsc::Receiver<Datagram>>,
+    close_requests: mpsc::Sender<CloseWebTransportSession>,
     driver_result: SharedResultGet<DriverError>,
 }
 
@@ -52,6 +59,7 @@ impl Driver {
         let ready_uni_wt_streams = mpsc::channel(4);
         let ready_bi_wt_streams = mpsc::channel(1);
         let ready_datagrams = mpsc::channel(1);
+        let close_requests = mpsc::channel(1);
         let driver_result = shared_result();
 
         tokio::spawn(
@@ -62,6 +70,7 @@ impl Driver {
                 ready_uni_wt_streams.0,
                 ready_bi_wt_streams.0,
                 ready_datagrams.0,
+                close_requests.1,
                 driver_result.0,
             )
             .run()
@@ -75,8 +84,21 @@ impl Driver {
             ready_uni_wt_streams: Mutex::new(ready_uni_wt_streams.1),
             ready_bi_wt_streams: Mutex::new(ready_bi_wt_streams.1),
             ready_datagrams: Mutex::new(ready_datagrams.1),
+            close_requests: close_requests.0,
             driver_result: driver_result.1,
         }
+    }
+
+    /// Closes the session with `close_session` and waits for the driver to terminate.
+    pub async fn close_session(&self, close_session: CloseWebTransportSession) {
+        // An error means the driver has already terminated.
+        let _ = self.close_requests.send(close_session).await;
+        let _ = self.terminated().await;
+    }
+
+    /// Waits for the driver to terminate and returns its error (`None` if it panicked).
+    pub async fn terminated(&self) -> Option<DriverError> {
+        self.driver_result.result().await
     }
 
     pub async fn accept_settings(&self) -> Result<Settings, DriverError> {
@@ -228,7 +250,7 @@ impl Driver {
     }
 
     async fn result(&self) -> DriverError {
-        match self.driver_result.result().await {
+        match self.terminated().await {
             Some(error) => error,
             None => panic!("Driver worker panic!"),
         }
@@ -260,6 +282,7 @@ mod worker {
         ready_uni_wt_streams: mpsc::Sender<StreamUniRemoteWT>,
         ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
         ready_datagrams: mpsc::Sender<Datagram>,
+        close_requests: mpsc::Receiver<CloseWebTransportSession>,
         driver_result: SharedResultSet<DriverError>,
         local_settings_stream: LocalSettingsStream,
         remote_settings_stream: RemoteSettingsStream,
@@ -269,6 +292,7 @@ mod worker {
     }
 
     impl Worker {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             quic_connection: quinn::Connection,
             ready_settings: mpsc::Sender<Settings>,
@@ -276,6 +300,7 @@ mod worker {
             ready_uni_wt_streams: mpsc::Sender<StreamUniRemoteWT>,
             ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
             ready_datagrams: mpsc::Sender<Datagram>,
+            close_requests: mpsc::Receiver<CloseWebTransportSession>,
             driver_result: SharedResultSet<DriverError>,
         ) -> Self {
             Self {
@@ -285,6 +310,7 @@ mod worker {
                 ready_uni_wt_streams,
                 ready_bi_wt_streams,
                 ready_datagrams,
+                close_requests,
                 driver_result,
                 local_settings_stream: LocalSettingsStream::empty(),
                 remote_settings_stream: RemoteSettingsStream::empty(),
@@ -302,10 +328,19 @@ mod worker {
                 .await
                 .expect_err("Worker must return an error");
 
+            // The worker still sends a close request queued when it ends with no close of its
+            // own.
+            let error = match error {
+                DriverError::NotConnected if self.close_queued_session().await => {
+                    DriverError::LocallyClosed
+                }
+                error => error,
+            };
+
             debug!("Ended with error: {:?}", error);
 
             match &error {
-                DriverError::ApplicationClosed(_) => {
+                DriverError::ApplicationClosed(_) | DriverError::LocallyClosed => {
                     // Termination procedure
                     // TODO Reset send sides of all streams with SessionGone error
                     self.quic_connection
@@ -382,11 +417,47 @@ mod worker {
                         return Err(error);
                     }
 
+                    // A request can arrive while the session stream is still queued in
+                    // `ready_sessions`, so it waits until the stream is taken.
+                    close_session = self.close_requests.recv(), if !self.connect_stream.is_empty() => {
+                        let Some(close_session) = close_session else {
+                            return Err(DriverError::NotConnected);
+                        };
+
+                        self.close_session(close_session).await;
+                        return Err(DriverError::LocallyClosed);
+                    }
+
                     () = self.driver_result.closed() => {
                         return Err(DriverError::NotConnected);
                     }
                 }
             }
+        }
+
+        /// Closes the session if a close request is still queued, and returns whether it did.
+        async fn close_queued_session(&mut self) -> bool {
+            let Ok(close_session) = self.close_requests.try_recv() else {
+                return false;
+            };
+
+            if self.connect_stream.is_empty() {
+                let Some(stream_session) = self.ready_sessions.try_recv() else {
+                    return false;
+                };
+                self.connect_stream.set_stream(stream_session);
+            }
+
+            self.close_session(close_session).await;
+            true
+        }
+
+        async fn close_session(&mut self, close_session: CloseWebTransportSession) {
+            let _ = tokio::time::timeout(
+                SESSION_CLOSE_TIMEOUT,
+                self.connect_stream.close(close_session),
+            )
+            .await;
         }
 
         async fn open_and_send_settings(&mut self) -> Result<(), DriverError> {
