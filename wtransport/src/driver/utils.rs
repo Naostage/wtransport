@@ -148,6 +148,11 @@ impl<T> BiChannelEndpoint<T> {
     pub async fn recv(&self) -> Option<T> {
         self.receiver.lock().await.recv().await
     }
+
+    /// Takes a queued value. Returns `None` if there is none, or if a `recv` holds the receiver.
+    pub fn try_recv(&self) -> Option<T> {
+        self.receiver.try_lock().ok()?.try_recv().ok()
+    }
 }
 
 pub fn bichannel<T>(capacity: usize) -> (BiChannelEndpoint<T>, BiChannelEndpoint<T>) {

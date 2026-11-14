@@ -552,6 +552,21 @@ pub mod session {
             let _ = self.stream.0.finish().await;
         }
 
+        /// Finishes the send side and waits for the peer to acknowledge it and to end the
+        /// receive side, discarding what it reads.
+        pub async fn finish_and_drain(&mut self) {
+            let (send_stream, recv_stream) = &mut self.stream;
+            let proto = &self.proto;
+
+            let finish = async {
+                let _ = send_stream.finish().await;
+            };
+
+            let drain = async { while proto.read_frame_async(recv_stream).await.is_ok() {} };
+
+            tokio::join!(finish, drain);
+        }
+
         pub fn reset(&mut self, error_code: VarInt) {
             let _ = self.stream.0.reset(error_code);
         }

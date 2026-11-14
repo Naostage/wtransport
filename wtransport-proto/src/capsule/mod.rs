@@ -82,4 +82,44 @@ mod tests {
         assert_eq!(close.error_code(), VarInt::from_u32(0));
         assert_eq!(close.reason(), "");
     }
+
+    #[test]
+    fn capsule_close_wt_session_roundtrip() {
+        let frame =
+            capsules::CloseWebTransportSession::new(4001, "access revoked").generate_frame();
+        assert!(matches!(frame.kind(), FrameKind::Data));
+
+        let capsule = Capsule::with_frame(&frame).unwrap();
+        let close =
+            capsules::CloseWebTransportSession::with_capsule(&capsule).expect("Should parse");
+        assert_eq!(close.error_code(), VarInt::from_u32(4001));
+        assert_eq!(close.reason(), "access revoked");
+    }
+
+    #[test]
+    fn capsule_close_wt_session_wire() {
+        let frame = capsules::CloseWebTransportSession::new(4001, "bye").generate_frame();
+
+        // Type 0x2843 and length 7 as varints, then the 32-bit code and the reason.
+        assert_eq!(
+            frame.payload(),
+            [0x68, 0x43, 0x07, 0x00, 0x00, 0x0f, 0xa1, b'b', b'y', b'e']
+        );
+    }
+
+    #[test]
+    fn capsule_close_wt_session_max_reason() {
+        let reason = "a".repeat(1024);
+        let frame = capsules::CloseWebTransportSession::new(1, &reason).generate_frame();
+        let capsule = Capsule::with_frame(&frame).unwrap();
+        let close =
+            capsules::CloseWebTransportSession::with_capsule(&capsule).expect("Should parse");
+        assert_eq!(close.reason(), reason);
+    }
+
+    #[test]
+    #[should_panic(expected = "reason is longer than 1024 bytes")]
+    fn capsule_close_wt_session_reason_too_long() {
+        capsules::CloseWebTransportSession::new(1, "a".repeat(1025));
+    }
 }
