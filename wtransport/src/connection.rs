@@ -314,14 +314,18 @@ impl Connection {
     /// as a WebTransport session close (a `CLOSE_WEBTRANSPORT_SESSION` capsule), which
     /// is what browsers expose as `WebTransportCloseInfo`.
     ///
-    /// This sends the capsule and finishes the session's CONNECT stream, then waits for the peer
-    /// to close the connection. The connection is closed locally if the peer does not within a
-    /// few seconds. This method returns once the connection is closed.
+    /// This sends the capsule and finishes the session's CONNECT stream, then waits up to
+    /// 3 seconds for the peer to acknowledge them and to end its side of the stream, before
+    /// closing the connection. It returns once the connection is closed.
+    ///
+    /// Once polled, the close goes on even if the returned future is dropped. If the connection
+    /// is already closed, this sends nothing.
     ///
     /// # Panics
     ///
     /// Panics if `reason` is longer than
-    /// [`MAX_REASON_LEN`](wtransport_proto::capsule::capsules::MAX_REASON_LEN) bytes.
+    /// [`MAX_REASON_LEN`](crate::proto::capsule::capsules::CloseWebTransportSession::MAX_REASON_LEN)
+    /// bytes.
     pub async fn close_session(&self, error_code: u32, reason: &str) {
         let close_session = CloseWebTransportSession::new(error_code, reason);
         self.driver.close_session(close_session).await;
@@ -330,16 +334,17 @@ impl Connection {
 
     /// Waits for the connection to be closed for any reason.
     ///
-    /// If the session was closed (see [`close_session`](Self::close_session)), this returns
-    /// the code and reason of the session close rather than of the QUIC connection close.
+    /// If the peer closed the session, with a `CLOSE_WEBTRANSPORT_SESSION` capsule or by
+    /// finishing the CONNECT stream, this returns [`ConnectionError::ApplicationClosed`] with the
+    /// session's code and reason rather than the QUIC connection close. After
+    /// [`close_session`](Self::close_session), it returns [`ConnectionError::LocallyClosed`].
     pub async fn closed(&self) -> ConnectionError {
         let quic_error = self.quic_connection.closed().await;
 
         match self.driver.terminated().await {
-            Some(DriverError::ApplicationClosed(close)) => {
-                ConnectionError::ApplicationClosed(close)
-            }
-            Some(DriverError::LocallyClosed) => ConnectionError::LocallyClosed,
+            Some(
+                driver_error @ (DriverError::ApplicationClosed(_) | DriverError::LocallyClosed),
+            ) => ConnectionError::with_driver_error(driver_error, &self.quic_connection),
             Some(DriverError::Proto(_) | DriverError::NotConnected) | None => quic_error.into(),
         }
     }
@@ -461,13 +466,23 @@ impl Connection {
 #[cfg(all(test, feature = "self-signed"))]
 mod tests {
     use super::*;
+    use crate::driver::streams::session::StreamSession;
+    use crate::driver::streams::ProtoReadError;
+    use crate::endpoint::endpoint_side::Client;
+    use crate::endpoint::endpoint_side::Server;
     use crate::error::ApplicationClose;
+    use crate::tls::Sha256Digest;
     use crate::ClientConfig;
     use crate::Endpoint;
     use crate::Identity;
     use crate::ServerConfig;
+    use std::time::Instant;
+    use wtransport_proto::bytes::IoReadError;
+    use wtransport_proto::capsule::Capsule;
+    use wtransport_proto::frame::FrameKind;
+    use wtransport_proto::session::SessionRequest as SessionRequestProto;
 
-    async fn session_pair() -> (Connection, Connection) {
+    fn server_endpoint() -> (Endpoint<Server>, String, Sha256Digest) {
         let identity = Identity::self_signed(["localhost"]).unwrap();
         let hash = identity.certificate_chain().as_slice()[0].hash();
 
@@ -480,23 +495,81 @@ mod tests {
         .unwrap();
         let url = format!("https://127.0.0.1:{}", server.local_addr().unwrap().port());
 
-        let client = Endpoint::client(
+        (server, url, hash)
+    }
+
+    fn client_endpoint(hash: Sha256Digest) -> Endpoint<Client> {
+        Endpoint::client(
             ClientConfig::builder()
                 .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
                 .with_server_certificate_hashes([hash])
                 .build(),
         )
-        .unwrap();
-
-        let accepting = async { server.accept().await.await.unwrap().accept().await.unwrap() };
-
-        let (server_connection, client_connection) =
-            tokio::join!(accepting, async { client.connect(url).await.unwrap() });
-
-        (server_connection, client_connection)
+        .unwrap()
     }
 
-    /// Asserts `error_code` reached `connection` through the capsule, not the QUIC close.
+    async fn accept(server: &Endpoint<Server>) -> Connection {
+        server.accept().await.await.unwrap().accept().await.unwrap()
+    }
+
+    async fn session_pair() -> (Connection, Connection) {
+        let (server, url, hash) = server_endpoint();
+        let client = client_endpoint(hash);
+
+        tokio::join!(accept(&server), async {
+            client.connect(url).await.unwrap()
+        })
+    }
+
+    /// Opens a session whose CONNECT stream only the test reads. The client's QUIC stack
+    /// acknowledges what the server sends, and nothing answers it.
+    async fn silent_client(url: &str, hash: Sha256Digest) -> (Driver, StreamSession) {
+        let config = ClientConfig::builder()
+            .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .with_server_certificate_hashes([hash])
+            .build();
+
+        let mut endpoint = quinn::Endpoint::new(
+            config.endpoint_config,
+            None,
+            config.bind_address_config.bind_socket().unwrap(),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap();
+        endpoint.set_default_client_config(config.quic_config);
+
+        let address = url.strip_prefix("https://").unwrap().parse().unwrap();
+        let quic_connection = endpoint
+            .connect(address, "127.0.0.1")
+            .unwrap()
+            .await
+            .unwrap();
+
+        let driver = Driver::init(quic_connection);
+        driver.accept_settings().await.unwrap();
+
+        let mut stream_session = driver
+            .open_session(SessionRequestProto::new(url).unwrap())
+            .await
+            .unwrap();
+        stream_session
+            .write_frame(stream_session.request().headers().generate_frame())
+            .await
+            .unwrap();
+        let response = stream_session.read_frame().await.unwrap();
+        assert!(matches!(response.kind(), FrameKind::Headers));
+
+        (driver, stream_session)
+    }
+
+    fn application_closed(error_code: u32, reason: &str) -> ConnectionError {
+        ConnectionError::ApplicationClosed(ApplicationClose::new(
+            VarInt::from_u32(error_code),
+            reason.as_bytes().to_vec().into_boxed_slice(),
+        ))
+    }
+
+    /// Asserts the QUIC connection close seen by `connection` does not carry `error_code`.
     fn assert_not_in_quic_close(connection: &Connection, error_code: u32) {
         assert!(!matches!(
             connection.quic_connection.close_reason(),
@@ -509,36 +582,19 @@ mod tests {
     async fn close_session_sends_code_and_reason_in_capsule() {
         let (server, client) = session_pair().await;
 
-        tokio::spawn(async move { server.close_session(4001, "access revoked").await });
+        let (closed, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.closed(),
+                server.close_session(4001, "access revoked")
+            )
+        })
+        .await
+        .unwrap();
 
-        let closed = tokio::time::timeout(Duration::from_secs(5), client.closed())
-            .await
-            .unwrap();
-        assert_eq!(
-            closed,
-            ConnectionError::ApplicationClosed(ApplicationClose::new(
-                VarInt::from_u32(4001),
-                b"access revoked".to_vec().into_boxed_slice()
-            ))
-        );
-
+        assert_eq!(closed, application_closed(4001, "access revoked"));
         assert_not_in_quic_close(&client, 4001);
-    }
-
-    #[tokio::test]
-    async fn close_session_closes_connection() {
-        let (server, _client) = session_pair().await;
-
-        tokio::time::timeout(Duration::from_secs(5), server.close_session(0, ""))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), server.closed())
-                .await
-                .unwrap(),
-            ConnectionError::LocallyClosed
-        );
+        assert!(server.quic_connection.close_reason().is_some());
+        assert_eq!(server.closed().await, ConnectionError::LocallyClosed);
     }
 
     #[tokio::test]
@@ -550,14 +606,116 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(5), server.closed())
             .await
             .unwrap();
-        assert_eq!(
-            closed,
-            ConnectionError::ApplicationClosed(ApplicationClose::new(
-                VarInt::from_u32(7),
-                b"bye".to_vec().into_boxed_slice()
-            ))
-        );
-
+        assert_eq!(closed, application_closed(7, "bye"));
         assert_not_in_quic_close(&server, 7);
+    }
+
+    #[tokio::test]
+    async fn close_session_right_after_accept_sends_capsule() {
+        let (server, url, hash) = server_endpoint();
+        let client = client_endpoint(hash);
+
+        // The driver may still hold the accepted session in its queue. The worker then has
+        // both requests ready and must take the session first.
+        for _ in 0..16 {
+            let closing = async {
+                let connection = accept(&server).await;
+                connection.close_session(4001, "access revoked").await;
+            };
+
+            let ((), closed) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(closing, async {
+                    client.connect(url.as_str()).await.unwrap().closed().await
+                })
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(closed, application_closed(4001, "access revoked"));
+        }
+    }
+
+    #[tokio::test]
+    async fn crossing_close_sessions_return_before_timeout() {
+        let (server, client) = session_pair().await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                server.close_session(4001, "server"),
+                client.close_session(4002, "client")
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(server.closed().await, ConnectionError::LocallyClosed);
+        assert_eq!(client.closed().await, ConnectionError::LocallyClosed);
+    }
+
+    #[tokio::test]
+    async fn close_session_sends_capsule_then_fin() {
+        let (server, url, hash) = server_endpoint();
+
+        let (connection, (_driver, mut stream_session)) =
+            tokio::join!(accept(&server), silent_client(&url, hash));
+        tokio::spawn(async move { connection.close_session(4001, "access revoked").await });
+
+        let frame = stream_session.read_frame().await.unwrap();
+        let close =
+            CloseWebTransportSession::with_capsule(&Capsule::with_frame(&frame).unwrap()).unwrap();
+        assert_eq!(close.error_code(), VarInt::from_u32(4001));
+        assert_eq!(close.reason(), "access revoked");
+
+        assert!(matches!(
+            stream_session.read_frame().await,
+            Err(ProtoReadError::IO(IoReadError::ImmediateFin))
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_session_closes_connection_when_peer_never_answers() {
+        let (server, url, hash) = server_endpoint();
+
+        let (connection, _silent_client) = tokio::join!(accept(&server), silent_client(&url, hash));
+
+        let start = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connection.close_session(4001, "access revoked"),
+        )
+        .await
+        .unwrap();
+
+        assert!(start.elapsed() >= Duration::from_secs(3));
+        assert_eq!(connection.closed().await, ConnectionError::LocallyClosed);
+    }
+
+    #[tokio::test]
+    async fn close_session_returns_when_already_closed() {
+        let (server, _client) = session_pair().await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            server.close_session(4001, "access revoked").await;
+            server.close_session(4002, "again").await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_session_goes_on_when_future_dropped() {
+        let (server, client) = session_pair().await;
+
+        // Polls the close once, then drops it.
+        tokio::select! {
+            biased;
+            () = server.close_session(4001, "access revoked") => unreachable!(),
+            () = std::future::ready(()) => {}
+        }
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .unwrap();
+        assert_eq!(closed, application_closed(4001, "access revoked"));
     }
 }

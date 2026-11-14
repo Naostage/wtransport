@@ -65,7 +65,6 @@ mod capsule_types {
 /// Capsules types implementations.
 pub mod capsules {
     pub use super::close_wt_session::CloseWebTransportSession;
-    pub use super::close_wt_session::MAX_REASON_LEN;
 }
 
 mod close_wt_session;
@@ -99,8 +98,13 @@ mod tests {
 
     #[test]
     fn capsule_close_wt_session_wire() {
-        let frame = capsules::CloseWebTransportSession::new(0, "").generate_frame();
-        assert_eq!(frame.payload(), [104, 67, 4, 0, 0, 0, 0]);
+        let frame = capsules::CloseWebTransportSession::new(4001, "bye").generate_frame();
+
+        // Type 0x2843 and length 7 as varints, then the 32-bit code and the reason.
+        assert_eq!(
+            frame.payload(),
+            [0x68, 0x43, 0x07, 0x00, 0x00, 0x0f, 0xa1, b'b', b'y', b'e']
+        );
     }
 
     #[test]
@@ -114,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "reason is longer than 1024 bytes")]
     fn capsule_close_wt_session_reason_too_long() {
         capsules::CloseWebTransportSession::new(1, "a".repeat(1025));
     }
